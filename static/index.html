@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GGUF Explorer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">G</span>
+        <span>GGUF Explorer</span>
+      </div>
+      <div class="model-open">
+        <form id="open-form" class="open-form">
+          <input id="path-input" name="path" autocomplete="off" spellcheck="false" placeholder="GGUF path or folder" />
+          <button class="primary" type="submit">Load</button>
+          <button id="scan-button" type="button">Scan</button>
+        </form>
+        <div id="model-browser" class="model-browser"></div>
+      </div>
+    </header>
+
+    <main class="app-shell">
+      <aside class="sidebar">
+        <section class="summary-strip" id="summary-strip">
+          <span>No file</span>
+        </section>
+        <section class="reference-strip">
+          <div class="reference-heading">Reference</div>
+          <form id="reference-form" class="reference-form">
+            <input id="reference-path-input" autocomplete="off" spellcheck="false" placeholder="BF16 reference GGUF path" />
+            <button class="primary" type="submit">Load</button>
+            <button id="reference-clear-button" type="button">Clear</button>
+          </form>
+          <div id="reference-summary" class="reference-summary">No reference</div>
+        </section>
+        <label class="field-label" for="filter-input">Filter</label>
+        <input id="filter-input" class="filter-input" autocomplete="off" spellcheck="false" />
+        <nav id="breadcrumbs" class="breadcrumbs"></nav>
+        <div id="node-list" class="node-list" role="tree"></div>
+      </aside>
+
+      <div
+        id="split-resizer"
+        class="split-resizer"
+        role="separator"
+        aria-label="Resize layer browser"
+        aria-orientation="vertical"
+        tabindex="0"
+        title="Drag to resize the layer browser"
+      ></div>
+
+      <section class="workspace">
+        <div id="empty-state" class="empty-state"></div>
+        <section id="detail-panel" class="detail-panel hidden"></section>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden" role="status"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
