@@ -72,6 +72,71 @@ const VALUE_COLUMN_DEFS = {
       style: (row) => `--diff-alpha: ${diffHeatAlpha(referenceDiff(row))};`,
     },
   ],
+  q4_0: [
+    {
+      id: "index",
+      label: "Index",
+      tooltip: "Zero-based flat index within the tensor.",
+      cell: (row) => row.index,
+    },
+    {
+      id: "coords",
+      label: "Coords",
+      tooltip: "Tensor coordinates decoded from the flat index using GGUF dimension order.",
+      className: "mono",
+      cell: (row) => escapeHtml(formatDimensions(row.coords)),
+    },
+    {
+      id: "block",
+      label: "Block",
+      tooltip: "Q4_0 block number. Each block stores one scale and 32 values packed as 4-bit nibbles.",
+      cell: (row) => row.block,
+    },
+    {
+      id: "in_block",
+      label: "In block",
+      tooltip: "Position inside the current 32-value Q4_0 block.",
+      cell: (row) => row.in_block,
+    },
+    {
+      id: "raw",
+      label: "Raw q",
+      tooltip: "The signed 4-bit value (-8 to 7) stored on disk before the block scale is applied.",
+      cell: (row) => row.raw,
+    },
+    {
+      id: "scale",
+      label: "Scale",
+      tooltip: "Half-precision scale stored at the start of the Q4_0 block.",
+      cell: (row) => formatNumber(row.scale),
+    },
+    {
+      id: "value",
+      label: "Value",
+      tooltip: "Displayed value for the active mode. Static shows raw q; Final shows dequantized.",
+      cell: (row) => formatNumber(row.value),
+    },
+    {
+      id: "decoded",
+      label: "Final",
+      tooltip: "Dequantized value computed as scale multiplied by the raw q value.",
+      cell: (row) => formatNumber(row.decoded),
+    },
+    {
+      id: "reference",
+      label: "Reference",
+      tooltip: "Decoded value from the matching tensor in the loaded reference GGUF, usually BF16.",
+      cell: (row) => formatOptionalNumber(row.reference_value),
+    },
+    {
+      id: "diff",
+      label: "Diff",
+      tooltip: "Final quantized value minus the matching reference value. The cell tint grows with absolute difference.",
+      className: "diff-cell",
+      cell: (row) => formatOptionalNumber(referenceDiff(row)),
+      style: (row) => `--diff-alpha: ${diffHeatAlpha(referenceDiff(row))};`,
+    },
+  ],
   scalar: [
     {
       id: "index",
@@ -154,6 +219,7 @@ const VALUE_COLUMN_LABEL_MIN_WIDTHS = {
 
 const VALUE_COLUMN_VISIBILITY_VERSION = {
   q8_0: 2,
+  q4_0: 2,
   scalar: 1,
 };
 
@@ -177,6 +243,10 @@ const state = {
   modelsLoading: false,
   modelsError: "",
   modelBrowserOpen: true,
+  optimizing: false,
+  optimizationJob: null,
+  optimizationResult: null,
+  optimizationError: "",
   valueColumnOrder: {
     q8_0: loadValueColumnOrder("q8_0"),
     scalar: loadValueColumnOrder("scalar"),
@@ -216,6 +286,7 @@ const numberFormatter = new Intl.NumberFormat();
 let draggedValueColumnId = null;
 let resizingValueColumn = null;
 let modelScanTimer = 0;
+let optimizationPollTimer = 0;
 
 init();
 
@@ -399,6 +470,87 @@ async function useDiscoveredModelAsReference(path) {
   await openReferencePath(path);
 }
 
+async function optimizeQuantization() {
+  if (!state.file) {
+    showToast("Load a Q8_0 GGUF before optimizing", true);
+    return;
+  }
+  if (!state.referenceFile) {
+    showToast("Load a reference GGUF before optimizing", true);
+    return;
+  }
+  state.optimizing = true;
+  state.optimizationJob = null;
+  state.optimizationResult = null;
+  state.optimizationError = "";
+  render();
+  try {
+    const payload = await api("/api/optimize/q8_0", {
+      method: "POST",
+      body: JSON.stringify({ passes: 8, chunk_blocks: 8192, parallelism: "process" }),
+    });
+    applyOptimizationJob(payload.optimization_job || null);
+    scheduleOptimizationPoll(250);
+  } catch (error) {
+    state.optimizationError = error.message;
+    state.optimizing = false;
+    render();
+  }
+}
+
+function scheduleOptimizationPoll(delayMs = 750) {
+  window.clearTimeout(optimizationPollTimer);
+  if (!state.optimizing) return;
+  optimizationPollTimer = window.setTimeout(pollOptimizationStatus, delayMs);
+}
+
+async function pollOptimizationStatus() {
+  try {
+    const payload = await api("/api/optimize/q8_0/status");
+    const job = payload.optimization_job || null;
+    applyOptimizationJob(job);
+    if (job && ["queued", "preparing", "running"].includes(job.status)) {
+      scheduleOptimizationPoll(750);
+    }
+  } catch (error) {
+    state.optimizationError = error.message;
+    state.optimizing = false;
+    render();
+  }
+}
+
+function applyOptimizationJob(job) {
+  state.optimizationJob = job;
+  const status = job?.status || "idle";
+  const active = ["queued", "preparing", "running"].includes(status);
+  state.optimizing = active;
+  if (status === "error") {
+    state.optimizationError = job?.error || job?.progress?.message || "Optimization failed";
+    render();
+    return;
+  }
+  state.optimizationError = "";
+  if (status === "complete") {
+    const statePayload = job?.state_payload || null;
+    const result = statePayload?.optimization || job?.result || null;
+    if (statePayload) {
+      applyStatePayload(statePayload);
+      if (statePayload.file?.path) {
+        els.pathInput.value = statePayload.file.path;
+        localStorage.setItem("ggufExplorer.path", statePayload.file.path);
+      }
+    }
+    state.optimizationJob = job;
+    state.optimizationResult = result;
+    state.optimizing = false;
+    const changed = numberFormatter.format(result?.changed_blocks || 0);
+    showToast(`Optimized Q8_0 blocks: ${changed} changed`);
+    render();
+    return;
+  }
+  render();
+}
+
 async function clearReference() {
   const payload = await api("/api/reference/clear", { method: "POST" });
   localStorage.removeItem("ggufExplorer.referencePath");
@@ -418,6 +570,9 @@ function applyStatePayload(payload) {
     state.currentPath = [];
     state.selectedTensor = null;
     state.tensorDetail = null;
+    state.optimizationJob = null;
+    state.optimizationResult = null;
+    state.optimizationError = "";
     resetValueState();
     render();
     return;
@@ -429,6 +584,9 @@ function applyStatePayload(payload) {
   state.currentPath = [];
   state.selectedTensor = null;
   state.tensorDetail = null;
+  state.optimizationJob = null;
+  state.optimizationResult = null;
+  state.optimizationError = "";
   resetValueState();
   render();
 }
@@ -443,6 +601,12 @@ function applyReferencePayload(reference, shouldRender = true) {
 
 async function reloadCurrentValues() {
   if (state.tensorDetail?.supports_values) {
+    const name = state.tensorDetail.name;
+    try {
+      const detail = await api(`/api/tensor?name=${encodeURIComponent(name)}&_=${Date.now()}`);
+      state.tensorDetail = detail;
+    } catch { /* keep current detail */ }
+    renderTensorDetail();
     await loadValues();
   } else {
     render();
@@ -741,6 +905,7 @@ function renderFileDetail() {
           ${displayModelName(state.file) ? `<p>${escapeHtml(displayModelName(state.file))}</p>` : ""}
           <p class="mono">${escapeHtml(state.file.path)}</p>
         </div>
+        ${optimizationButtonHtml()}
       </div>
       <div class="panel-body">
         <div class="stat-grid">
@@ -751,6 +916,7 @@ function renderFileDetail() {
           ${stat("Alignment", `${state.file.alignment} bytes`)}
           ${stat("Data start", state.file.data_start)}
         </div>
+        ${optimizationStatusHtml()}
       </div>
     </section>
     <section class="panel">
@@ -773,6 +939,76 @@ function renderFileDetail() {
       <div class="panel-body metadata-list">${metadataRows}</div>
     </section>
   `;
+  wireOptimizationControls();
+}
+
+function optimizationButtonHtml() {
+  const q8Count = Number(state.file?.type_counts?.Q8_0 || 0);
+  const q4Count = Number(state.file?.type_counts?.Q4_0 || 0);
+  if (!q8Count && !q4Count) return "";
+  const disabled = state.optimizing || !state.referenceFile ? "disabled" : "";
+  const label = state.optimizing ? "Optimizing..." : "Optimize quantization";
+  const title = state.referenceFile
+    ? "Create an optimized copy by rewriting quantized scales and values against the loaded reference."
+    : "Load a reference GGUF first.";
+  return `<div class="panel-actions"><button type="button" id="optimize-q8-button" class="primary" title="${escapeHtml(title)}" ${disabled}>${escapeHtml(label)}</button></div>`;
+}
+
+function optimizationStatusHtml() {
+  const q8Count = Number(state.file?.type_counts?.Q8_0 || 0);
+  const q4Count = Number(state.file?.type_counts?.Q4_0 || 0);
+  if (!q8Count && !q4Count) return "";
+  if (state.optimizationError) {
+    return `<div class="notice error optimize-status">${escapeHtml(state.optimizationError)}</div>`;
+  }
+  if (state.optimizing) {
+    const progress = state.optimizationJob?.progress || {};
+    const percentValue = Number(progress.progress_percent || 0);
+    const percent = Number.isFinite(percentValue) ? clamp(percentValue, 0, 100) : 0;
+    const processed = numberFormatter.format(progress.processed_blocks || 0);
+    const total = numberFormatter.format(progress.total_blocks || 0);
+    const workers = progress.workers ? `${numberFormatter.format(progress.workers)} ${progress.parallelism || "process"} workers` : "workers starting";
+    const tensor = progress.current_tensor ? `Current tensor: ${escapeHtml(progress.current_tensor)}<br />` : "";
+    return `
+      <div class="notice optimize-status optimize-progress-wrap">
+        <div class="optimize-progress-header">
+          <strong>${escapeHtml(progress.message || "Optimizing quantized tensors into a new GGUF copy")}</strong>
+          <span>${formatNumber(percent)}%</span>
+        </div>
+        <div class="optimize-progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeHtml(String(Math.round(percent)))}">
+          <span style="width: ${escapeHtml(String(percent))}%"></span>
+        </div>
+        <div class="optimize-progress-meta">
+          ${tensor}
+          Processed ${processed} of ${total} blocks; changed ${numberFormatter.format(progress.changed_blocks || 0)} blocks; using ${escapeHtml(workers)}; ${numberFormatter.format(progress.passes || 8)} passes.
+        </div>
+      </div>
+    `;
+  }
+  if (state.optimizationResult) {
+    const result = state.optimizationResult;
+    const percent = Number.isFinite(result.improvement_percent)
+      ? `${formatNumber(result.improvement_percent)}%`
+      : "n/a";
+    return `
+      <div class="compare-status ready optimize-status">
+        Optimized copy: <span class="mono">${escapeHtml(result.output_path || state.file.path)}</span><br />
+        Changed ${numberFormatter.format(result.changed_blocks || 0)} of ${numberFormatter.format(result.total_blocks || 0)} blocks; SSE improvement ${formatNumber(result.improvement || 0)} (${percent}).
+      </div>
+    `;
+  }
+  if (!state.referenceFile) {
+    return `<div class="compare-status optimize-status">Load a BF16/native reference GGUF, then use Optimize quantization to create an optimized copy.</div>`;
+  }
+  const parts = [];
+  if (q8Count) parts.push(`${numberFormatter.format(q8Count)} Q8_0`);
+  if (q4Count) parts.push(`${numberFormatter.format(q4Count)} Q4_0`);
+  return `<div class="compare-status optimize-status">Ready to optimize ${parts.join(", ")} tensor${parts.join(",").split(",").length !== 1 ? "s" : ""} against ${escapeHtml(state.referenceFile.name)}.</div>`;
+}
+
+function wireOptimizationControls() {
+  const button = document.querySelector("#optimize-q8-button");
+  if (button) button.addEventListener("click", optimizeQuantization);
 }
 
 function renderGroupDetail(node) {
@@ -860,7 +1096,8 @@ function valuePanelHtml(tensor) {
     return `<div class="notice error">${escapeHtml(state.valueError)}</div>`;
   }
   if (state.valuePayload) {
-    return `${comparisonStatusHtml(tensor, state.valuePayload.reference)}${valuesTable(state.valuePayload.rows, tensor.type_name)}`;
+    const kind = valueColumnKind(tensor.type_name);
+    return `${comparisonStatusHtml(tensor, state.valuePayload.reference)}${valueStatsHtml(kind)}${valuesTable(state.valuePayload.rows, tensor.type_name)}`;
   }
   if (state.valuesLoading) {
     return `<div class="notice">Loading values</div>`;
@@ -871,10 +1108,36 @@ function valuePanelHtml(tensor) {
   return `<div class="notice">Value sampling is not implemented for ${escapeHtml(tensor.type_name)}.</div>`;
 }
 
+function valueStatsHtml(kind) {
+  if (kind !== "q8_0" && kind !== "q4_0") return "";
+  const stats = state.tensorDetail?.stats;
+  if (!stats) return "";
+  const deq = state.valuesMode === "dequantized";
+  const valueMin = deq ? stats.decoded_min : stats.raw_min;
+  const valueMax = deq ? stats.decoded_max : stats.raw_max;
+  let html = `<div class="value-stats">`;
+  html += stat("Scales", numberFormatter.format(stats.unique_scales));
+  html += stat("Scale min", formatNumber(stats.scale_min));
+  html += stat("Scale max", formatNumber(stats.scale_max));
+  html += stat("Value min", formatNumber(valueMin));
+  html += stat("Value max", formatNumber(valueMax));
+  html += stat("Final min", formatNumber(stats.decoded_min));
+  html += stat("Final max", formatNumber(stats.decoded_max));
+  if (Number.isFinite(stats.reference_min)) {
+    html += stat("Ref min", formatNumber(stats.reference_min));
+    html += stat("Ref max", formatNumber(stats.reference_max));
+    html += stat("Diff min", formatOptionalNumber(stats.diff_min));
+    html += stat("Diff max", formatOptionalNumber(stats.diff_max));
+  }
+  html += `</div>`;
+  return html;
+}
+
 function comparisonStatusHtml(tensor, reference) {
-  if (valueColumnKind(tensor.type_name) !== "q8_0") return "";
+  const kind = valueColumnKind(tensor.type_name);
+  if (kind !== "q8_0" && kind !== "q4_0") return "";
   if (!reference?.open) {
-    return `<div class="compare-status">Load a BF16 reference GGUF to populate Reference and Diff for this Q8_0 tensor.</div>`;
+    return `<div class="compare-status">Load a BF16 reference GGUF to populate Reference and Diff for this ${tensor.type_name} tensor.</div>`;
   }
   if (!reference.compatible) {
     return `<div class="compare-status warning">${escapeHtml(reference.message || "Reference tensor cannot be compared with this tensor.")}</div>`;
@@ -889,6 +1152,7 @@ function comparisonStatusHtml(tensor, reference) {
 function valueToolbar(tensor) {
   const disabled = tensor.supports_values ? "" : "disabled";
   const kind = valueColumnKind(tensor.type_name);
+  const isQuantized = kind === "q8_0" || kind === "q4_0";
   return `
     <div class="toolbar">
       <div class="segmented" role="group">
@@ -904,6 +1168,7 @@ function valueToolbar(tensor) {
         <input id="sample-count" type="number" min="1" max="1024" step="1" value="${state.sampleCount}" ${disabled} />
       </label>
       <button type="button" id="sample-refresh" ${disabled}>Refresh</button>
+      ${isQuantized ? `<button type="button" id="analyze-duplicates" ${disabled} title="Count consecutive duplicate raw Q values across the entire tensor">Dup count</button>` : ""}
       <div class="column-tools">
         <button type="button" id="column-menu-button" aria-expanded="false" ${disabled}>Columns</button>
         <button type="button" id="column-reset" title="Reset column order, visibility, and widths" ${disabled}>Reset</button>
@@ -943,6 +1208,10 @@ function wireValueControls() {
   if (refresh) {
     refresh.addEventListener("click", loadValues);
   }
+  const dupButton = panel.querySelector("#analyze-duplicates");
+  if (dupButton) {
+    dupButton.addEventListener("click", analyzeConsecutiveDuplicates);
+  }
   wireColumnToolbarControls();
   wireValueColumnControls();
 }
@@ -970,6 +1239,21 @@ function wireColumnToolbarControls() {
       setColumnVisible(currentValueColumnKind(), checkbox.dataset.columnToggle, checkbox.checked);
     });
   });
+}
+
+async function analyzeConsecutiveDuplicates() {
+  const tensor = state.tensorDetail;
+  if (!tensor || !tensor.supports_values) return;
+  const name = tensor.name;
+  try {
+    const payload = await api(`/api/tensor/consecutive_duplicates?name=${encodeURIComponent(name)}`);
+    const count = payload.consecutive_duplicates;
+    const total = payload.element_count;
+    const pct = total > 0 ? ((count / (total - 1)) * 100).toFixed(1) : "0.0";
+    showToast(`Consecutive duplicates: ${numberFormatter.format(count)} of ${numberFormatter.format(total)} values (${pct}%)`);
+  } catch (error) {
+    showToast(error.message, true);
+  }
 }
 
 async function loadValues() {
@@ -1056,7 +1340,9 @@ function valueCellHtml(column, row) {
 }
 
 function valueColumnKind(typeName) {
-  return typeName === "Q8_0" ? "q8_0" : "scalar";
+  if (typeName === "Q8_0") return "q8_0";
+  if (typeName === "Q4_0") return "q4_0";
+  return "scalar";
 }
 
 function getOrderedValueColumns(kind) {
@@ -1140,7 +1426,7 @@ function migrateVisibleColumns(kind, visibleColumns) {
   const currentVersion = VALUE_COLUMN_VISIBILITY_VERSION[kind] || 1;
   const storedVersion = Number(localStorage.getItem(`ggufExplorer.visibleColumnsVersion.${kind}`) || "1");
   const normalized = normalizeVisibleColumns(kind, visibleColumns);
-  if (kind === "q8_0" && storedVersion < 2 && !normalized.includes("reference")) {
+  if ((kind === "q8_0" || kind === "q4_0") && storedVersion < 2 && !normalized.includes("reference")) {
     const diffIndex = normalized.indexOf("diff");
     if (diffIndex >= 0) {
       normalized.splice(diffIndex, 0, "reference");

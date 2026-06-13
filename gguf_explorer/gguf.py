@@ -18,7 +18,7 @@ DEFAULT_ALIGNMENT = 32
 MAX_METADATA_ARRAY_PREVIEW = 12
 MAX_METADATA_STRING_PREVIEW = 320
 MAX_VALUE_SAMPLE_COUNT = 1024
-SAMPLEABLE_KINDS = {"f32", "f16", "bf16", "f64", "i8", "i16", "i32", "i64", "q8_0"}
+SAMPLEABLE_KINDS = {"f32", "f16", "bf16", "f64", "i8", "i16", "i32", "i64", "q8_0", "q4_0"}
 
 
 GGUF_VALUE_TYPES: dict[int, tuple[str, int | None, str | None]] = {
@@ -56,7 +56,7 @@ class GgmlTypeInfo:
 GGML_TYPES: dict[int, GgmlTypeInfo] = {
     0: GgmlTypeInfo(0, "F32", 1, 4, "f32"),
     1: GgmlTypeInfo(1, "F16", 1, 2, "f16"),
-    2: GgmlTypeInfo(2, "Q4_0", 32, 18, "unsupported_quant"),
+    2: GgmlTypeInfo(2, "Q4_0", 32, 18, "q4_0"),
     3: GgmlTypeInfo(3, "Q4_1", 32, 20, "unsupported_quant"),
     6: GgmlTypeInfo(6, "Q5_0", 32, 22, "unsupported_quant"),
     7: GgmlTypeInfo(7, "Q5_1", 32, 24, "unsupported_quant"),
@@ -342,9 +342,9 @@ class GgufFile:
             for entry in self.metadata
         ]
 
-    def tensor_detail(self, name: str) -> dict[str, Any]:
+    def tensor_detail(self, name: str, reference: GgufFile | None = None) -> dict[str, Any]:
         tensor = self._get_tensor(name)
-        return {
+        detail: dict[str, Any] = {
             "index": tensor.index,
             "name": tensor.name,
             "dimensions": tensor.dimensions,
@@ -357,6 +357,9 @@ class GgufFile:
             "byte_size": tensor.byte_size,
             "supports_values": tensor.type_info is not None and tensor.type_info.kind in SAMPLEABLE_KINDS,
         }
+        if tensor.type_info is not None and tensor.type_info.is_quantized and tensor.type_info.kind in ("q8_0", "q4_0"):
+            detail["stats"] = self._tensor_quantized_stats(tensor, reference)
+        return detail
 
     def tree(self) -> dict[str, Any]:
         if self._tree is None:
@@ -430,6 +433,8 @@ class GgufFile:
 
         if type_info.kind == "q8_0":
             rows = self._sample_q8_0(tensor, start, count, mode)
+        elif type_info.kind == "q4_0":
+            rows = self._sample_q4_0(tensor, start, count, mode)
         elif type_info.kind in {"f32", "f16", "bf16", "f64", "i8", "i16", "i32", "i64"}:
             rows = self._sample_scalar(tensor, start, count, mode)
         else:
@@ -581,6 +586,263 @@ class GgufFile:
                 }
             )
         return rows
+
+    def _sample_q4_0(self, tensor: TensorInfo, start: int, count: int, mode: str) -> list[dict[str, Any]]:
+        type_info = tensor.type_info
+        assert type_info is not None
+        block_size = type_info.block_size
+        block_bytes = type_info.type_size
+        start_block = start // block_size
+        end_block = (start + count - 1) // block_size
+        block_count = end_block - start_block + 1
+        with self._lock:
+            self._file.seek(tensor.absolute_offset + start_block * block_bytes)
+            raw = self._file.read(block_count * block_bytes)
+        if len(raw) != block_count * block_bytes:
+            raise GgufError("Could not read the requested Q4_0 block range")
+
+        rows = []
+        for index in range(start, start + count):
+            block_index = index // block_size
+            in_block = index % block_size
+            local_block = block_index - start_block
+            block = raw[local_block * block_bytes : (local_block + 1) * block_bytes]
+            scale = struct.unpack("<e", block[:2])[0]
+            qs = block[2:]
+            if in_block < block_size // 2:
+                quantized = (qs[in_block] & 0x0F) - 8
+            else:
+                quantized = (qs[in_block - block_size // 2] >> 4) - 8
+            dequantized = scale * quantized
+            rows.append(
+                {
+                    "index": index,
+                    "coords": flat_index_to_coords(index, tensor.dimensions),
+                    "block": block_index,
+                    "in_block": in_block,
+                    "raw": quantized,
+                    "scale": scale,
+                    "value": quantized if mode == "static" else dequantized,
+                    "decoded": dequantized,
+                }
+            )
+        return rows
+
+    def _tensor_quantized_stats(
+        self,
+        tensor: TensorInfo,
+        reference: GgufFile | None = None,
+    ) -> dict[str, Any]:
+        type_info = tensor.type_info
+        assert type_info is not None
+        block_size = type_info.block_size
+        block_bytes = type_info.type_size
+        element_count = tensor.element_count
+        block_count = (element_count + block_size - 1) // block_size
+
+        # Determine if we have a compatible reference for paired scanning
+        ref_tensor: TensorInfo | None = None
+        ref_type: GgmlTypeInfo | None = None
+        ref_size = 0
+        if reference is not None:
+            t = reference.tensors_by_name.get(tensor.name)
+            if t is not None and t.dimensions == tensor.dimensions:
+                rt = t.type_info
+                if rt is not None and rt.kind in SAMPLEABLE_KINDS:
+                    ref_tensor = t
+                    ref_type = rt
+                    ref_size = rt.type_size
+
+        unique_scales: set[float] = set()
+        scale_min = float("inf")
+        scale_max = float("-inf")
+        decoded_min = float("inf")
+        decoded_max = float("-inf")
+        raw_min = float("inf")
+        raw_max = float("-inf")
+        diff_min = float("inf")
+        diff_max = float("-inf")
+        ref_min = float("inf")
+        ref_max = float("-inf")
+
+        chunk_blocks = 65536
+        with self._lock:
+            self._file.seek(tensor.absolute_offset)
+            remaining = block_count
+            block_start = 0
+            while remaining > 0:
+                to_read = min(chunk_blocks, remaining)
+                data = self._file.read(to_read * block_bytes)
+
+                # Read matching reference chunk (without holding self._lock)
+                ref_chunk = b""
+                ref_values: list[float] = []
+                if ref_tensor is not None:
+                    assert reference is not None
+                    if ref_type.is_quantized:  # type: ignore[union-attr]
+                        ref_block_bytes = ref_type.type_size  # type: ignore[union-attr]
+                        ref_block_size = ref_type.block_size  # type: ignore[union-attr]
+                        ref_blocks_needed = (to_read * block_size + ref_block_size - 1) // ref_block_size
+                        with reference._lock:
+                            ref_block_offset = (block_start * block_size) // ref_block_size
+                            reference._file.seek(ref_tensor.absolute_offset + ref_block_offset * ref_block_bytes)
+                            ref_data = reference._file.read(ref_blocks_needed * ref_block_bytes)
+                        for bi in range(ref_blocks_needed):
+                            boff = bi * ref_block_bytes
+                            rscale = struct.unpack("<e", ref_data[boff : boff + 2])[0]
+                            for j in range(ref_block_size):
+                                elem_global = block_start * block_size + bi * ref_block_size + j
+                                if elem_global >= element_count:
+                                    break
+                                if ref_type.kind == "q8_0":  # type: ignore[union-attr]
+                                    rv = struct.unpack("<b", ref_data[boff + 2 + j : boff + 3 + j])[0]
+                                else:
+                                    ref_qs = ref_data[boff + 2 : boff + 2 + ref_block_size // 2]
+                                    rv = (ref_qs[j // 2] >> (4 * (j % 2)) & 0x0F) - 8
+                                ref_values.append(rscale * rv)
+                    else:
+                        ref_elem_offset = block_start * block_size * ref_size
+                        with reference._lock:
+                            reference._file.seek(ref_tensor.absolute_offset + ref_elem_offset)
+                            ref_data = reference._file.read(to_read * block_size * ref_size)
+                        ref_values = [decode_scalar(ref_data[i * ref_size : (i + 1) * ref_size], ref_type.kind) for i in range(to_read * block_size)]  # type: ignore[union-attr]
+
+                for i in range(to_read):
+                    off = i * block_bytes
+                    block = data[off : off + block_bytes]
+                    scale = struct.unpack("<e", block[:2])[0]
+                    unique_scales.add(scale)
+                    if scale < scale_min:
+                        scale_min = scale
+                    if scale > scale_max:
+                        scale_max = scale
+
+                    vals = min(block_size, element_count - (block_start + i) * block_size)
+                    if type_info.kind == "q8_0":
+                        for j in range(vals):
+                            raw = struct.unpack("<b", block[2 + j : 3 + j])[0]
+                            decoded = scale * raw
+                            if raw < raw_min:
+                                raw_min = raw
+                            if raw > raw_max:
+                                raw_max = raw
+                            if decoded < decoded_min:
+                                decoded_min = decoded
+                            if decoded > decoded_max:
+                                decoded_max = decoded
+                            if ref_values:
+                                elem_idx = i * block_size + j
+                                rv = ref_values[elem_idx]
+                                d = decoded - rv
+                                if rv < ref_min:
+                                    ref_min = rv
+                                if rv > ref_max:
+                                    ref_max = rv
+                                if d < diff_min:
+                                    diff_min = d
+                                if d > diff_max:
+                                    diff_max = d
+                    elif type_info.kind == "q4_0":
+                        qs = block[2:]
+                        n_half = block_size // 2
+                        for j in range(vals):
+                            if j < n_half:
+                                raw = (qs[j] & 0x0F) - 8
+                            else:
+                                raw = (qs[j - n_half] >> 4) - 8
+                            decoded = scale * raw
+                            if raw < raw_min:
+                                raw_min = raw
+                            if raw > raw_max:
+                                raw_max = raw
+                            if decoded < decoded_min:
+                                decoded_min = decoded
+                            if decoded > decoded_max:
+                                decoded_max = decoded
+                            if ref_values:
+                                elem_idx = i * block_size + j
+                                rv = ref_values[elem_idx]
+                                d = decoded - rv
+                                if rv < ref_min:
+                                    ref_min = rv
+                                if rv > ref_max:
+                                    ref_max = rv
+                                if d < diff_min:
+                                    diff_min = d
+                                if d > diff_max:
+                                    diff_max = d
+                remaining -= to_read
+                block_start += to_read
+
+        result: dict[str, Any] = {
+            "unique_scales": len(unique_scales),
+            "scale_min": scale_min,
+            "scale_max": scale_max,
+            "raw_min": raw_min,
+            "raw_max": raw_max,
+            "decoded_min": decoded_min,
+            "decoded_max": decoded_max,
+        }
+
+        if ref_tensor is not None:
+            result["reference_min"] = ref_min
+            result["reference_max"] = ref_max
+            result["diff_min"] = diff_min
+            result["diff_max"] = diff_max
+
+        return result
+
+    def count_consecutive_duplicates(self, name: str) -> dict[str, Any]:
+        tensor = self._get_tensor(name)
+        type_info = tensor.type_info
+        if not type_info or type_info.kind not in ("q8_0", "q4_0"):
+            raise GgufError(f"Consecutive duplicate counting is only supported for Q8_0 and Q4_0 tensors, got {type_info.name if type_info else 'unknown'}")
+        block_size = type_info.block_size
+        block_bytes = type_info.type_size
+        element_count = tensor.element_count
+        block_count = (element_count + block_size - 1) // block_size
+
+        consecutive_duplicates = 0
+        prev_raw = None
+
+        chunk_blocks = 65536
+        with self._lock:
+            self._file.seek(tensor.absolute_offset)
+            remaining = block_count
+            while remaining > 0:
+                to_read = min(chunk_blocks, remaining)
+                data = self._file.read(to_read * block_bytes)
+
+                for i in range(to_read):
+                    off = i * block_bytes
+                    block = data[off : off + block_bytes]
+                    vals = min(block_size, element_count - (block_count - remaining + i) * block_size)
+
+                    if type_info.kind == "q8_0":
+                        for j in range(vals):
+                            raw = struct.unpack("<b", block[2 + j : 3 + j])[0]
+                            if prev_raw is not None and raw == prev_raw:
+                                consecutive_duplicates += 1
+                            prev_raw = raw
+                    elif type_info.kind == "q4_0":
+                        qs = block[2:]
+                        n_half = block_size // 2
+                        for j in range(vals):
+                            if j < n_half:
+                                raw = (qs[j] & 0x0F) - 8
+                            else:
+                                raw = (qs[j - n_half] >> 4) - 8
+                            if prev_raw is not None and raw == prev_raw:
+                                consecutive_duplicates += 1
+                            prev_raw = raw
+
+                remaining -= to_read
+
+        return {
+            "tensor_name": name,
+            "element_count": element_count,
+            "consecutive_duplicates": consecutive_duplicates,
+        }
 
     def _get_tensor(self, name: str) -> TensorInfo:
         tensor = self.tensors_by_name.get(name)

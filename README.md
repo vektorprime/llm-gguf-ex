@@ -57,3 +57,11 @@ $env:GGUF_EXPLORER_EXPECT_FINAL='-0.029269218'
 $env:GGUF_EXPLORER_EXPECT_STATIC='-47'
 node tools\verify_ui.cjs
 ```
+
+## Q8_0 quantization optimizer
+
+The GUI now includes an **Optimize quantization** button on the main file detail page when the loaded model contains Q8_0 tensors. Load the Q8_0 GGUF as the main model and a BF16/F16/F32/native GGUF as the Reference, then click the button to create a sibling optimized copy such as `model.optimized.gguf`. The server opens the optimized copy automatically when the rewrite completes.
+
+The optimizer is implemented in `gguf_explorer/optimize_q8_0.py` and exposed through `POST /api/optimize/q8_0`. It walks every compatible Q8_0 tensor with a matching reference tensor, processes Q8_0 blocks in parallel worker threads, and rewrites only tensor payload blocks in the copied GGUF. Metadata and tensor layout are preserved.
+
+For each Q8_0 block, it alternates between choosing clamped int8 values for the current scale and recomputing the least-squares scale for those int8 values. The candidate scale is rounded to the FP16 value actually stored by the Q8_0 block before error is measured, and an existing block is preserved if the rewrite would not improve squared error.
