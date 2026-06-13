@@ -643,7 +643,7 @@ class GgufFile:
         # Determine if we have a compatible reference for paired scanning
         ref_tensor: TensorInfo | None = None
         ref_type: GgmlTypeInfo | None = None
-        ref_size = 0
+        ref_info: tuple[str, int, int, int, str] | None = None
         if reference is not None:
             t = reference.tensors_by_name.get(tensor.name)
             if t is not None and t.dimensions == tensor.dimensions:
@@ -651,7 +651,59 @@ class GgufFile:
                 if rt is not None and rt.kind in SAMPLEABLE_KINDS:
                     ref_tensor = t
                     ref_type = rt
-                    ref_size = rt.type_size
+                    ref_info = (str(reference.path), ref_tensor.absolute_offset, rt.type_size, rt.block_size, rt.kind)
+
+        # Decide whether to parallelize across CPU cores
+        MIN_BLOCKS_FOR_PARALLEL = 512
+        use_parallel = block_count >= MIN_BLOCKS_FOR_PARALLEL
+
+        if use_parallel:
+            try:
+                import multiprocessing
+                from concurrent.futures import ProcessPoolExecutor, as_completed
+
+                cpu_count = multiprocessing.cpu_count()
+                workers = max(2, min(cpu_count, block_count // 256))
+                workers = min(workers, 16)
+                blocks_per_worker = max(1, block_count // workers)
+
+                chunks: list[tuple[int, int]] = []
+                for ws in range(0, block_count, blocks_per_worker):
+                    we = min(ws + blocks_per_worker, block_count)
+                    chunks.append((ws, we - ws))
+
+                partials: list[dict[str, Any]] = []
+                with ProcessPoolExecutor(max_workers=workers) as executor:
+                    futures = [
+                        executor.submit(
+                            _compute_chunk_stats,
+                            str(self.path), tensor.absolute_offset,
+                            bs, nb,
+                            block_size, block_bytes, element_count,
+                            type_info.kind, ref_info,
+                        )
+                        for bs, nb in chunks
+                    ]
+                    for future in as_completed(futures):
+                        partials.append(future.result())
+            except Exception:
+                partials = [
+                    _compute_chunk_stats(
+                        str(self.path), tensor.absolute_offset,
+                        0, block_count,
+                        block_size, block_bytes, element_count,
+                        type_info.kind, ref_info,
+                    )
+                ]
+        else:
+            partials = [
+                _compute_chunk_stats(
+                    str(self.path), tensor.absolute_offset,
+                    0, block_count,
+                    block_size, block_bytes, element_count,
+                    type_info.kind, ref_info,
+                )
+            ]
 
         unique_scales: set[float] = set()
         scale_min = float("inf")
@@ -660,119 +712,35 @@ class GgufFile:
         decoded_max = float("-inf")
         raw_min = float("inf")
         raw_max = float("-inf")
-        diff_min = float("inf")
-        diff_max = float("-inf")
         ref_min = float("inf")
         ref_max = float("-inf")
+        diff_min = float("inf")
+        diff_max = float("-inf")
+        has_ref = ref_info is not None
 
-        chunk_blocks = 65536
-        with self._lock:
-            self._file.seek(tensor.absolute_offset)
-            remaining = block_count
-            block_start = 0
-            while remaining > 0:
-                to_read = min(chunk_blocks, remaining)
-                data = self._file.read(to_read * block_bytes)
-
-                # Read matching reference chunk (without holding self._lock)
-                ref_chunk = b""
-                ref_values: list[float] = []
-                if ref_tensor is not None:
-                    assert reference is not None
-                    if ref_type.is_quantized:  # type: ignore[union-attr]
-                        ref_block_bytes = ref_type.type_size  # type: ignore[union-attr]
-                        ref_block_size = ref_type.block_size  # type: ignore[union-attr]
-                        ref_blocks_needed = (to_read * block_size + ref_block_size - 1) // ref_block_size
-                        with reference._lock:
-                            ref_block_offset = (block_start * block_size) // ref_block_size
-                            reference._file.seek(ref_tensor.absolute_offset + ref_block_offset * ref_block_bytes)
-                            ref_data = reference._file.read(ref_blocks_needed * ref_block_bytes)
-                        for bi in range(ref_blocks_needed):
-                            boff = bi * ref_block_bytes
-                            rscale = struct.unpack("<e", ref_data[boff : boff + 2])[0]
-                            for j in range(ref_block_size):
-                                elem_global = block_start * block_size + bi * ref_block_size + j
-                                if elem_global >= element_count:
-                                    break
-                                if ref_type.kind == "q8_0":  # type: ignore[union-attr]
-                                    rv = struct.unpack("<b", ref_data[boff + 2 + j : boff + 3 + j])[0]
-                                else:
-                                    ref_qs = ref_data[boff + 2 : boff + 2 + ref_block_size // 2]
-                                    rv = (ref_qs[j // 2] >> (4 * (j % 2)) & 0x0F) - 8
-                                ref_values.append(rscale * rv)
-                    else:
-                        ref_elem_offset = block_start * block_size * ref_size
-                        with reference._lock:
-                            reference._file.seek(ref_tensor.absolute_offset + ref_elem_offset)
-                            ref_data = reference._file.read(to_read * block_size * ref_size)
-                        ref_values = [decode_scalar(ref_data[i * ref_size : (i + 1) * ref_size], ref_type.kind) for i in range(to_read * block_size)]  # type: ignore[union-attr]
-
-                for i in range(to_read):
-                    off = i * block_bytes
-                    block = data[off : off + block_bytes]
-                    scale = struct.unpack("<e", block[:2])[0]
-                    unique_scales.add(scale)
-                    if scale < scale_min:
-                        scale_min = scale
-                    if scale > scale_max:
-                        scale_max = scale
-
-                    vals = min(block_size, element_count - (block_start + i) * block_size)
-                    if type_info.kind == "q8_0":
-                        for j in range(vals):
-                            raw = struct.unpack("<b", block[2 + j : 3 + j])[0]
-                            decoded = scale * raw
-                            if raw < raw_min:
-                                raw_min = raw
-                            if raw > raw_max:
-                                raw_max = raw
-                            if decoded < decoded_min:
-                                decoded_min = decoded
-                            if decoded > decoded_max:
-                                decoded_max = decoded
-                            if ref_values:
-                                elem_idx = i * block_size + j
-                                rv = ref_values[elem_idx]
-                                d = decoded - rv
-                                if rv < ref_min:
-                                    ref_min = rv
-                                if rv > ref_max:
-                                    ref_max = rv
-                                if d < diff_min:
-                                    diff_min = d
-                                if d > diff_max:
-                                    diff_max = d
-                    elif type_info.kind == "q4_0":
-                        qs = block[2:]
-                        n_half = block_size // 2
-                        for j in range(vals):
-                            if j < n_half:
-                                raw = (qs[j] & 0x0F) - 8
-                            else:
-                                raw = (qs[j - n_half] >> 4) - 8
-                            decoded = scale * raw
-                            if raw < raw_min:
-                                raw_min = raw
-                            if raw > raw_max:
-                                raw_max = raw
-                            if decoded < decoded_min:
-                                decoded_min = decoded
-                            if decoded > decoded_max:
-                                decoded_max = decoded
-                            if ref_values:
-                                elem_idx = i * block_size + j
-                                rv = ref_values[elem_idx]
-                                d = decoded - rv
-                                if rv < ref_min:
-                                    ref_min = rv
-                                if rv > ref_max:
-                                    ref_max = rv
-                                if d < diff_min:
-                                    diff_min = d
-                                if d > diff_max:
-                                    diff_max = d
-                remaining -= to_read
-                block_start += to_read
+        for p in partials:
+            unique_scales.update(p["unique_scales"])
+            if p["scale_min"] < scale_min:
+                scale_min = p["scale_min"]
+            if p["scale_max"] > scale_max:
+                scale_max = p["scale_max"]
+            if p["raw_min"] < raw_min:
+                raw_min = p["raw_min"]
+            if p["raw_max"] > raw_max:
+                raw_max = p["raw_max"]
+            if p["decoded_min"] < decoded_min:
+                decoded_min = p["decoded_min"]
+            if p["decoded_max"] > decoded_max:
+                decoded_max = p["decoded_max"]
+            if has_ref and p.get("has_ref"):
+                if p.get("ref_min", float("inf")) < ref_min:
+                    ref_min = p["ref_min"]
+                if p.get("ref_max", float("-inf")) > ref_max:
+                    ref_max = p["ref_max"]
+                if p.get("diff_min", float("inf")) < diff_min:
+                    diff_min = p["diff_min"]
+                if p.get("diff_max", float("-inf")) > diff_max:
+                    diff_max = p["diff_max"]
 
         result: dict[str, Any] = {
             "unique_scales": len(unique_scales),
@@ -784,7 +752,7 @@ class GgufFile:
             "decoded_max": decoded_max,
         }
 
-        if ref_tensor is not None:
+        if has_ref:
             result["reference_min"] = ref_min
             result["reference_max"] = ref_max
             result["diff_min"] = diff_min
@@ -849,6 +817,135 @@ class GgufFile:
         if tensor is None:
             raise GgufError(f"Tensor not found: {name}")
         return tensor
+
+
+def _compute_chunk_stats(
+    file_path: str,
+    tensor_offset: int,
+    block_start: int,
+    num_blocks: int,
+    block_size: int,
+    block_bytes: int,
+    element_count: int,
+    kind: str,
+    ref_info: tuple[str, int, int, int, str] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "unique_scales": set(),
+        "scale_min": float("inf"),
+        "scale_max": float("-inf"),
+        "raw_min": float("inf"),
+        "raw_max": float("-inf"),
+        "decoded_min": float("inf"),
+        "decoded_max": float("-inf"),
+    }
+    has_ref = ref_info is not None
+    if has_ref:
+        result["has_ref"] = True
+        result["ref_min"] = float("inf")
+        result["ref_max"] = float("-inf")
+        result["diff_min"] = float("inf")
+        result["diff_max"] = float("-inf")
+
+    with open(file_path, "rb") as f:
+        f.seek(tensor_offset + block_start * block_bytes)
+        data = f.read(num_blocks * block_bytes)
+
+    # Read matching reference chunk
+    ref_values: list[float] = []
+    if has_ref:
+        ref_path, ref_offset, ref_type_size, ref_block_size, ref_kind = ref_info  # type: ignore[misc]
+        with open(ref_path, "rb") as f:
+            if ref_block_size > 1:
+                ref_blocks_needed = (num_blocks * block_size + ref_block_size - 1) // ref_block_size
+                ref_block_offset = (block_start * block_size) // ref_block_size
+                f.seek(ref_offset + ref_block_offset * ref_type_size)
+                ref_data = f.read(ref_blocks_needed * ref_type_size)
+                for bi in range(ref_blocks_needed):
+                    boff = bi * ref_type_size
+                    rscale = struct.unpack("<e", ref_data[boff : boff + 2])[0]
+                    for j in range(ref_block_size):
+                        elem_global = block_start * block_size + bi * ref_block_size + j
+                        if elem_global >= element_count:
+                            break
+                        if ref_kind == "q8_0":
+                            rv = struct.unpack("<b", ref_data[boff + 2 + j : boff + 3 + j])[0]
+                        else:
+                            ref_qs = ref_data[boff + 2 : boff + 2 + ref_block_size // 2]
+                            rv = (ref_qs[j // 2] >> (4 * (j % 2)) & 0x0F) - 8
+                        ref_values.append(rscale * rv)
+            else:
+                ref_elem_offset = block_start * block_size * ref_type_size
+                f.seek(ref_offset + ref_elem_offset)
+                ref_data = f.read(num_blocks * block_size * ref_type_size)
+                ref_values = [decode_scalar(ref_data[i * ref_type_size : (i + 1) * ref_type_size], ref_kind) for i in range(num_blocks * block_size)]
+
+    for i in range(num_blocks):
+        off = i * block_bytes
+        block = data[off : off + block_bytes]
+        scale = struct.unpack("<e", block[:2])[0]
+        result["unique_scales"].add(scale)
+        if scale < result["scale_min"]:
+            result["scale_min"] = scale
+        if scale > result["scale_max"]:
+            result["scale_max"] = scale
+
+        vals = min(block_size, element_count - (block_start + i) * block_size)
+        if kind == "q8_0":
+            for j in range(vals):
+                raw = struct.unpack("<b", block[2 + j : 3 + j])[0]
+                decoded = scale * raw
+                if raw < result["raw_min"]:
+                    result["raw_min"] = raw
+                if raw > result["raw_max"]:
+                    result["raw_max"] = raw
+                if decoded < result["decoded_min"]:
+                    result["decoded_min"] = decoded
+                if decoded > result["decoded_max"]:
+                    result["decoded_max"] = decoded
+                if ref_values:
+                    elem_idx = i * block_size + j
+                    rv = ref_values[elem_idx]
+                    d = decoded - rv
+                    if rv < result["ref_min"]:
+                        result["ref_min"] = rv
+                    if rv > result["ref_max"]:
+                        result["ref_max"] = rv
+                    if d < result["diff_min"]:
+                        result["diff_min"] = d
+                    if d > result["diff_max"]:
+                        result["diff_max"] = d
+        elif kind == "q4_0":
+            qs = block[2:]
+            n_half = block_size // 2
+            for j in range(vals):
+                if j < n_half:
+                    raw = (qs[j] & 0x0F) - 8
+                else:
+                    raw = (qs[j - n_half] >> 4) - 8
+                decoded = scale * raw
+                if raw < result["raw_min"]:
+                    result["raw_min"] = raw
+                if raw > result["raw_max"]:
+                    result["raw_max"] = raw
+                if decoded < result["decoded_min"]:
+                    result["decoded_min"] = decoded
+                if decoded > result["decoded_max"]:
+                    result["decoded_max"] = decoded
+                if ref_values:
+                    elem_idx = i * block_size + j
+                    rv = ref_values[elem_idx]
+                    d = decoded - rv
+                    if rv < result["ref_min"]:
+                        result["ref_min"] = rv
+                    if rv > result["ref_max"]:
+                        result["ref_max"] = rv
+                    if d < result["diff_min"]:
+                        result["diff_min"] = d
+                    if d > result["diff_max"]:
+                        result["diff_max"] = d
+
+    return result
 
 
 def align_to(value: int, alignment: int) -> int:
