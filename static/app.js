@@ -243,10 +243,6 @@ const state = {
   modelsLoading: false,
   modelsError: "",
   modelBrowserOpen: true,
-  optimizing: false,
-  optimizationJob: null,
-  optimizationResult: null,
-  optimizationError: "",
   valueColumnOrder: {
     q8_0: loadValueColumnOrder("q8_0"),
     scalar: loadValueColumnOrder("scalar"),
@@ -286,7 +282,6 @@ const numberFormatter = new Intl.NumberFormat();
 let draggedValueColumnId = null;
 let resizingValueColumn = null;
 let modelScanTimer = 0;
-let optimizationPollTimer = 0;
 
 init();
 
@@ -470,87 +465,6 @@ async function useDiscoveredModelAsReference(path) {
   await openReferencePath(path);
 }
 
-async function optimizeQuantization() {
-  if (!state.file) {
-    showToast("Load a Q8_0 GGUF before optimizing", true);
-    return;
-  }
-  if (!state.referenceFile) {
-    showToast("Load a reference GGUF before optimizing", true);
-    return;
-  }
-  state.optimizing = true;
-  state.optimizationJob = null;
-  state.optimizationResult = null;
-  state.optimizationError = "";
-  render();
-  try {
-    const payload = await api("/api/optimize/q8_0", {
-      method: "POST",
-      body: JSON.stringify({ passes: 8, chunk_blocks: 8192, parallelism: "process" }),
-    });
-    applyOptimizationJob(payload.optimization_job || null);
-    scheduleOptimizationPoll(250);
-  } catch (error) {
-    state.optimizationError = error.message;
-    state.optimizing = false;
-    render();
-  }
-}
-
-function scheduleOptimizationPoll(delayMs = 750) {
-  window.clearTimeout(optimizationPollTimer);
-  if (!state.optimizing) return;
-  optimizationPollTimer = window.setTimeout(pollOptimizationStatus, delayMs);
-}
-
-async function pollOptimizationStatus() {
-  try {
-    const payload = await api("/api/optimize/q8_0/status");
-    const job = payload.optimization_job || null;
-    applyOptimizationJob(job);
-    if (job && ["queued", "preparing", "running"].includes(job.status)) {
-      scheduleOptimizationPoll(750);
-    }
-  } catch (error) {
-    state.optimizationError = error.message;
-    state.optimizing = false;
-    render();
-  }
-}
-
-function applyOptimizationJob(job) {
-  state.optimizationJob = job;
-  const status = job?.status || "idle";
-  const active = ["queued", "preparing", "running"].includes(status);
-  state.optimizing = active;
-  if (status === "error") {
-    state.optimizationError = job?.error || job?.progress?.message || "Optimization failed";
-    render();
-    return;
-  }
-  state.optimizationError = "";
-  if (status === "complete") {
-    const statePayload = job?.state_payload || null;
-    const result = statePayload?.optimization || job?.result || null;
-    if (statePayload) {
-      applyStatePayload(statePayload);
-      if (statePayload.file?.path) {
-        els.pathInput.value = statePayload.file.path;
-        localStorage.setItem("ggufExplorer.path", statePayload.file.path);
-      }
-    }
-    state.optimizationJob = job;
-    state.optimizationResult = result;
-    state.optimizing = false;
-    const changed = numberFormatter.format(result?.changed_blocks || 0);
-    showToast(`Optimized Q8_0 blocks: ${changed} changed`);
-    render();
-    return;
-  }
-  render();
-}
-
 async function clearReference() {
   const payload = await api("/api/reference/clear", { method: "POST" });
   localStorage.removeItem("ggufExplorer.referencePath");
@@ -570,9 +484,6 @@ function applyStatePayload(payload) {
     state.currentPath = [];
     state.selectedTensor = null;
     state.tensorDetail = null;
-    state.optimizationJob = null;
-    state.optimizationResult = null;
-    state.optimizationError = "";
     resetValueState();
     render();
     return;
@@ -584,9 +495,6 @@ function applyStatePayload(payload) {
   state.currentPath = [];
   state.selectedTensor = null;
   state.tensorDetail = null;
-  state.optimizationJob = null;
-  state.optimizationResult = null;
-  state.optimizationError = "";
   resetValueState();
   render();
 }
@@ -905,7 +813,6 @@ function renderFileDetail() {
           ${displayModelName(state.file) ? `<p>${escapeHtml(displayModelName(state.file))}</p>` : ""}
           <p class="mono">${escapeHtml(state.file.path)}</p>
         </div>
-        ${optimizationButtonHtml()}
       </div>
       <div class="panel-body">
         <div class="stat-grid">
@@ -916,7 +823,6 @@ function renderFileDetail() {
           ${stat("Alignment", `${state.file.alignment} bytes`)}
           ${stat("Data start", state.file.data_start)}
         </div>
-        ${optimizationStatusHtml()}
       </div>
     </section>
     <section class="panel">
@@ -939,76 +845,7 @@ function renderFileDetail() {
       <div class="panel-body metadata-list">${metadataRows}</div>
     </section>
   `;
-  wireOptimizationControls();
-}
-
-function optimizationButtonHtml() {
-  const q8Count = Number(state.file?.type_counts?.Q8_0 || 0);
-  const q4Count = Number(state.file?.type_counts?.Q4_0 || 0);
-  if (!q8Count && !q4Count) return "";
-  const disabled = state.optimizing || !state.referenceFile ? "disabled" : "";
-  const label = state.optimizing ? "Optimizing..." : "Optimize quantization";
-  const title = state.referenceFile
-    ? "Create an optimized copy by rewriting quantized scales and values against the loaded reference."
-    : "Load a reference GGUF first.";
-  return `<div class="panel-actions"><button type="button" id="optimize-q8-button" class="primary" title="${escapeHtml(title)}" ${disabled}>${escapeHtml(label)}</button></div>`;
-}
-
-function optimizationStatusHtml() {
-  const q8Count = Number(state.file?.type_counts?.Q8_0 || 0);
-  const q4Count = Number(state.file?.type_counts?.Q4_0 || 0);
-  if (!q8Count && !q4Count) return "";
-  if (state.optimizationError) {
-    return `<div class="notice error optimize-status">${escapeHtml(state.optimizationError)}</div>`;
-  }
-  if (state.optimizing) {
-    const progress = state.optimizationJob?.progress || {};
-    const percentValue = Number(progress.progress_percent || 0);
-    const percent = Number.isFinite(percentValue) ? clamp(percentValue, 0, 100) : 0;
-    const processed = numberFormatter.format(progress.processed_blocks || 0);
-    const total = numberFormatter.format(progress.total_blocks || 0);
-    const workers = progress.workers ? `${numberFormatter.format(progress.workers)} ${progress.parallelism || "process"} workers` : "workers starting";
-    const tensor = progress.current_tensor ? `Current tensor: ${escapeHtml(progress.current_tensor)}<br />` : "";
-    return `
-      <div class="notice optimize-status optimize-progress-wrap">
-        <div class="optimize-progress-header">
-          <strong>${escapeHtml(progress.message || "Optimizing quantized tensors into a new GGUF copy")}</strong>
-          <span>${formatNumber(percent)}%</span>
-        </div>
-        <div class="optimize-progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeHtml(String(Math.round(percent)))}">
-          <span style="width: ${escapeHtml(String(percent))}%"></span>
-        </div>
-        <div class="optimize-progress-meta">
-          ${tensor}
-          Processed ${processed} of ${total} blocks; changed ${numberFormatter.format(progress.changed_blocks || 0)} blocks; using ${escapeHtml(workers)}; ${numberFormatter.format(progress.passes || 8)} passes.
-        </div>
-      </div>
-    `;
-  }
-  if (state.optimizationResult) {
-    const result = state.optimizationResult;
-    const percent = Number.isFinite(result.improvement_percent)
-      ? `${formatNumber(result.improvement_percent)}%`
-      : "n/a";
-    return `
-      <div class="compare-status ready optimize-status">
-        Optimized copy: <span class="mono">${escapeHtml(result.output_path || state.file.path)}</span><br />
-        Changed ${numberFormatter.format(result.changed_blocks || 0)} of ${numberFormatter.format(result.total_blocks || 0)} blocks; SSE improvement ${formatNumber(result.improvement || 0)} (${percent}).
-      </div>
-    `;
-  }
-  if (!state.referenceFile) {
-    return `<div class="compare-status optimize-status">Load a BF16/native reference GGUF, then use Optimize quantization to create an optimized copy.</div>`;
-  }
-  const parts = [];
-  if (q8Count) parts.push(`${numberFormatter.format(q8Count)} Q8_0`);
-  if (q4Count) parts.push(`${numberFormatter.format(q4Count)} Q4_0`);
-  return `<div class="compare-status optimize-status">Ready to optimize ${parts.join(", ")} tensor${parts.join(",").split(",").length !== 1 ? "s" : ""} against ${escapeHtml(state.referenceFile.name)}.</div>`;
-}
-
-function wireOptimizationControls() {
-  const button = document.querySelector("#optimize-q8-button");
-  if (button) button.addEventListener("click", optimizeQuantization);
+  renderNodeList();
 }
 
 function renderGroupDetail(node) {

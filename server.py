@@ -5,16 +5,13 @@ import json
 import mimetypes
 import sys
 import threading
-import time
 import traceback
 import urllib.parse
-import uuid
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from gguf_explorer.gguf import GgufError, GgufFile, write_sample_gguf
-from gguf_explorer.optimize_q8_0 import OptimizationProgress, OptimizationSettings, optimize_q8_0_file
 
 
 ROOT = Path(__file__).resolve().parent
@@ -57,9 +54,6 @@ class AppState:
 
 
 STATE = AppState()
-OPTIMIZATION_LOCK = threading.RLock()
-OPTIMIZATION_JOB: dict[str, Any] | None = None
-ACTIVE_OPTIMIZATION_STATUSES = {"queued", "preparing", "running"}
 
 
 class ExplorerHandler(SimpleHTTPRequestHandler):
@@ -115,9 +109,6 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
                 directory_hint = one(query, "dir", "")
                 self.send_json(discovered_models_payload(directory_hint))
                 return
-            if parsed.path == "/api/optimize/q8_0/status":
-                self.send_json({"optimization_job": optimization_job_snapshot()})
-                return
             if parsed.path == "/api/sample":
                 sample_path = write_sample_gguf(ROOT / "samples" / "tiny-bf16-q8_0.gguf")
                 reader = STATE.open(str(sample_path))
@@ -148,33 +139,6 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/reference/clear":
                 STATE.clear_reference()
                 self.send_json(state_payload())
-                return
-            if parsed.path == "/api/optimize/q8_0":
-                reader = STATE.require_reader()
-                if STATE.reference_reader is None:
-                    raise GgufError("Load a reference GGUF before optimizing quantized tensors")
-                body = self.read_json_body()
-                passes = int(body.get("passes", 8))
-                workers_raw = body.get("workers")
-                workers = int(workers_raw) if workers_raw not in (None, "") else None
-                chunk_blocks = int(body.get("chunk_blocks", 8192))
-                parallelism = str(body.get("parallelism", "process")).strip().lower()
-                if parallelism not in {"process", "thread", "none"}:
-                    parallelism = "process"
-                output_path = str(body.get("output_path", "")).strip() or None
-                settings = OptimizationSettings(
-                    passes=passes,
-                    workers=workers,
-                    chunk_blocks=chunk_blocks,
-                    parallelism=parallelism,  # type: ignore[arg-type]
-                )
-                job = start_optimization_job(
-                    reader.path,
-                    STATE.reference_reader.path,
-                    output_path,
-                    settings,
-                )
-                self.send_json({"optimization_job": job}, status=202)
                 return
             self.send_error(404)
         except Exception as exc:
@@ -224,122 +188,6 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
-
-
-def start_optimization_job(
-    target_path: str,
-    reference_path: str,
-    output_path: str | None,
-    settings: OptimizationSettings,
-) -> dict[str, Any]:
-    global OPTIMIZATION_JOB
-    now = time.time()
-    job_id = uuid.uuid4().hex
-    with OPTIMIZATION_LOCK:
-        if OPTIMIZATION_JOB and OPTIMIZATION_JOB.get("status") in ACTIVE_OPTIMIZATION_STATUSES:
-            raise GgufError("A quantization optimization job is already running")
-        OPTIMIZATION_JOB = {
-            "id": job_id,
-            "active": True,
-            "status": "queued",
-            "error": "",
-            "created_at": now,
-            "updated_at": now,
-            "progress": {
-                "status": "queued",
-                "message": "Queued quantization optimization",
-                "total_blocks": 0,
-                "processed_blocks": 0,
-                "progress_percent": 0,
-                "changed_blocks": 0,
-                "previous_sse": 0,
-                "optimized_sse": 0,
-                "improvement": 0,
-                "workers": settings.workers,
-                "parallelism": settings.parallelism,
-                "passes": settings.passes,
-                "chunk_blocks": settings.chunk_blocks,
-                "output_path": output_path or "",
-                "current_tensor": None,
-            },
-            "result": None,
-            "state_payload": None,
-        }
-        snapshot = _job_snapshot_locked()
-
-    thread = threading.Thread(
-        target=_run_optimization_job,
-        args=(job_id, target_path, reference_path, output_path, settings),
-        daemon=True,
-    )
-    thread.start()
-    return snapshot
-
-
-def _run_optimization_job(
-    job_id: str,
-    target_path: str,
-    reference_path: str,
-    output_path: str | None,
-    settings: OptimizationSettings,
-) -> None:
-    def on_progress(progress: OptimizationProgress) -> None:
-        with OPTIMIZATION_LOCK:
-            if not OPTIMIZATION_JOB or OPTIMIZATION_JOB.get("id") != job_id:
-                return
-            OPTIMIZATION_JOB["status"] = progress.status
-            OPTIMIZATION_JOB["progress"] = progress.to_json()
-            OPTIMIZATION_JOB["updated_at"] = time.time()
-
-    try:
-        result = optimize_q8_0_file(
-            target_path,
-            reference_path,
-            output_path,
-            settings=settings,
-            progress_callback=on_progress,
-        )
-        optimized_reader = STATE.open(result.output_path)
-        payload = state_payload(optimized_reader)
-        payload["optimization"] = result.to_json()
-        with OPTIMIZATION_LOCK:
-            if not OPTIMIZATION_JOB or OPTIMIZATION_JOB.get("id") != job_id:
-                return
-            OPTIMIZATION_JOB["active"] = False
-            OPTIMIZATION_JOB["status"] = "complete"
-            OPTIMIZATION_JOB["result"] = result.to_json()
-            OPTIMIZATION_JOB["state_payload"] = payload
-            OPTIMIZATION_JOB["updated_at"] = time.time()
-    except Exception as exc:
-        traceback.print_exc()
-        with OPTIMIZATION_LOCK:
-            if not OPTIMIZATION_JOB or OPTIMIZATION_JOB.get("id") != job_id:
-                return
-            OPTIMIZATION_JOB["active"] = False
-            OPTIMIZATION_JOB["status"] = "error"
-            OPTIMIZATION_JOB["error"] = str(exc)
-            progress = dict(OPTIMIZATION_JOB.get("progress") or {})
-            progress["status"] = "error"
-            progress["message"] = str(exc)
-            OPTIMIZATION_JOB["progress"] = progress
-            OPTIMIZATION_JOB["updated_at"] = time.time()
-
-
-def optimization_job_snapshot() -> dict[str, Any]:
-    with OPTIMIZATION_LOCK:
-        return _job_snapshot_locked()
-
-
-def _job_snapshot_locked() -> dict[str, Any]:
-    if OPTIMIZATION_JOB is None:
-        return {"active": False, "status": "idle"}
-    snapshot = dict(OPTIMIZATION_JOB)
-    snapshot["progress"] = dict(OPTIMIZATION_JOB.get("progress") or {})
-    if OPTIMIZATION_JOB.get("result") is not None:
-        snapshot["result"] = dict(OPTIMIZATION_JOB["result"])
-    if OPTIMIZATION_JOB.get("state_payload") is not None:
-        snapshot["state_payload"] = OPTIMIZATION_JOB["state_payload"]
-    return snapshot
 
 
 def state_payload(reader: GgufFile | None = None) -> dict[str, Any]:
